@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# kate: space-indent on; indent-width 4; replace-tabs on;
 
 """
- *  Copyright (C) 2011-2012, it-novum GmbH
+ *  Copyright (C) 2011-2026, AVENDIS GmbH
  *  Copyright (c) 2017 SUSE LLC
  *
  *  openATTIC is free software; you can redistribute it and/or modify it
@@ -18,222 +17,161 @@
 
 import os
 import sys
+import argparse
 from time import time, mktime
 from datetime import datetime
 
 try:
-    # Python 3 variant
     from configparser import ConfigParser
 except ImportError:
-    # Python 2 variant
     from ConfigParser import ConfigParser
 
 try:
-    # Uncomment the following line to disable the device UUID check.
-    #raise ImportError
     from pyudev import Context, Device
+    HAVE_UDEV = True
 except ImportError:
     HAVE_UDEV = False
-else:
-    HAVE_UDEV = True
 
-
-# Resolve the real device path, dereferencing symlinks as necessary.
-disk = os.path.realpath(sys.argv[-1]).replace("/dev/", "")
-
-# Read the state file (if possible).
-state = ConfigParser()
-havestate = bool( state.read("/dev/shm/diskstats.%s" % disk) ) and state.has_section("state")
-
-
-exit = 0
-
-with open("/sys/block/%s/stat" % disk, "rb") as fd:
-    currstate = dict(zip((
-        "rd_ios", "rd_merges", "rd_sectors", "rd_ticks",
-        "wr_ios", "wr_merges", "wr_sectors", "wr_ticks",
-        "ios_in_prog", "tot_ticks", "rq_ticks"
-      ), [
-        int(count) for count in fd.read().split()
-    ]))
-    currstate["timestamp"] = time()
-
-
-# Sanity-Check the state file. We expect the Device UUID and creation timestamp to
-# match those from the statfile (if possible).
-
-if HAVE_UDEV:
-    ctx = Context()
-    dev = Device.from_name(ctx, "block", disk)
+def check_disk(disk_name, warning_threshold, critical_threshold):
+    """
+    Führt die Prüfung für eine einzelne Disk durch.
+    Gibt (exit_code, human_text, perf_data) zurück.
+    """
+    disk = os.path.basename(disk_name)
+    state_file = f"/dev/shm/diskstats.{disk}"
+    
+    state = ConfigParser()
+    havestate = bool(state.read(state_file)) and state.has_section("state")
+    exit_code = 0
 
     try:
-        createstamp = int(mktime((datetime.now() - dev.time_since_initialized).timetuple()))
-    except AttributeError:
-        createstamp = None
-else:
+        with open(f"/sys/block/{disk}/stat", "rb") as fd:
+            currstate = dict(zip((
+                "rd_ios", "rd_merges", "rd_sectors", "rd_ticks",
+                "wr_ios", "wr_merges", "wr_sectors", "wr_ticks",
+                "ios_in_prog", "tot_ticks", "rq_ticks"
+            ), [int(count) for count in fd.read().split()]))
+            currstate["timestamp"] = time()
+    except IOError:
+        return 3, f"{disk}: UNKNOWN (Read Error)", ""
+
     createstamp = None
+    dev = None
+    if HAVE_UDEV:
+        try:
+            ctx = Context()
+            dev = Device.from_name(ctx, "block", disk)
+            createstamp = int(mktime((datetime.now() - dev.time_since_initialized).timetuple()))
+        except Exception:
+            pass
 
-if havestate:
-    if not state.has_section("device"):
-        havestate = False
+    if havestate:
+        if not state.has_section("device") or \
+           (createstamp is not None and state.getint("device", "initialized", fallback=0) != createstamp):
+            havestate = False
+        if HAVE_UDEV and dev and "DM_UUID" in dev.keys() and \
+           state.get("device", "uuid", fallback="") != dev.get("DM_UUID"):
+            havestate = False
 
-    if createstamp is not None and (
-       not state.has_option("device", "initialized") or createstamp != state.getint("device", "initialized")):
-        havestate = False
+    if not havestate:
+        if not state.has_section("device"): state.add_section("device")
+        if createstamp is not None: state.set("device", "initialized", str(createstamp))
+        if HAVE_UDEV and dev and "DM_UUID" in dev.keys(): state.set("device", "uuid", dev.get("DM_UUID"))
 
-    if HAVE_UDEV and "DM_UUID" in dev.keys() and (
-       not state.has_option("device", "uuid") or dev.get("DM_UUID") != state.get("device", "uuid") ):
-        havestate = False
+    def wrapdiff(curr, last):
+        if last <= curr: return curr - last
+        for chkbound in (64,63,32,31,16,15):
+            if last > 2**chkbound: break
+            return 2**chkbound - last + curr
+        return curr
 
+    human_text = ""
+    perf_data = ""
 
-# If something's off about the state file (non-existant, empty, doesn't match), populate it with basic data.
-# (Note this can't be an else: statement because we need to re-check.)
-if not havestate:
-    if not state.has_section("device"):
-        state.add_section("device")
+    if havestate:
+        bytes_per_sector = 512
+        interval = float(currstate["timestamp"] - state.getfloat("state", "timestamp"))
+        if interval <= 0: interval = 0.001
 
-    if createstamp is not None:
-        state.set("device", "initialized", str(createstamp))
+        rd_ios = wrapdiff(currstate["rd_ios"], state.getfloat("state", "rd_ios"))
+        wr_ios = wrapdiff(currstate["wr_ios"], state.getfloat("state", "wr_ios"))
+        rd_ticks = wrapdiff(currstate["rd_ticks"], state.getfloat("state", "rd_ticks"))
+        wr_ticks = wrapdiff(currstate["wr_ticks"], state.getfloat("state", "wr_ticks"))
+        rd_sectors = wrapdiff(currstate["rd_sectors"], state.getfloat("state", "rd_sectors"))
+        wr_sectors = wrapdiff(currstate["wr_sectors"], state.getfloat("state", "wr_sectors"))
+        tot_ticks = wrapdiff(currstate["tot_ticks"], state.getfloat("state", "tot_ticks"))
 
-    if HAVE_UDEV and "DM_UUID" in dev.keys():
-        state.set("device", "uuid", dev.get("DM_UUID"))
+        rd_iops, wr_iops = rd_ios / interval, wr_ios / interval
+        rd_bps = (rd_sectors / interval) * bytes_per_sector
+        wr_bps = (wr_sectors / interval) * bytes_per_sector
+        tot_ios = rd_ios + wr_ios
+        tot_iops = tot_ios / interval
+        
+        rd_avg_size = (rd_sectors * bytes_per_sector / rd_ios) if rd_ios else 0
+        wr_avg_size = (wr_sectors * bytes_per_sector / wr_ios) if wr_ios else 0
+        
+        util_percent = (tot_ticks / (interval * 1000.)) * 100.
 
+        if util_percent > warning_threshold: exit_code = 1
+        if util_percent > critical_threshold: exit_code = 2
 
-def wrapdiff(curr, last):
-    """ Calculate the difference between last and curr.
+        status_str = "OK"
+        if exit_code == 1: status_str = "WARNING"
+        if exit_code == 2: status_str = "CRITICAL"
 
-        If last > curr, try to guess the boundary at which the value must have wrapped
-        by trying the maximum values of 64, 32 and 16 bit signed and unsigned ints.
-    """
-    if last <= curr:
-        return curr - last
-
-    boundary = None
-    for chkbound in (64,63,32,31,16,15):
-        if last > 2**chkbound:
-            break
-        boundary = chkbound
-    if boundary is None:
-        raise ArithmeticError("Couldn't determine boundary")
-    return 2**boundary - last + curr
-
-
-if havestate:
-    # <http://www.mjmwired.net/kernel/Documentation/block/stat.txt>
-    # | The "sectors" in question are the standard UNIX 512-byte
-    # | sectors, not any device- or filesystem-specific block size.
-    bytes_per_sector = 512
-
-    interval = float(currstate["timestamp"] - state.getfloat("state", "timestamp"))
-
-    rd_ios = wrapdiff(currstate["rd_ios"], state.getfloat("state", "rd_ios"))
-    wr_ios = wrapdiff(currstate["wr_ios"], state.getfloat("state", "wr_ios"))
-
-    rd_ticks = wrapdiff(currstate["rd_ticks"], state.getfloat("state", "rd_ticks"))
-    wr_ticks = wrapdiff(currstate["wr_ticks"], state.getfloat("state", "wr_ticks"))
-
-    rd_sectors = wrapdiff(currstate["rd_sectors"], state.getfloat("state", "rd_sectors"))
-    wr_sectors = wrapdiff(currstate["wr_sectors"], state.getfloat("state", "wr_sectors"))
-
-    tot_ticks  = wrapdiff(currstate["tot_ticks"], state.getfloat("state", "tot_ticks"))
-
-    rd_iops = rd_ios / interval
-    wr_iops = wr_ios / interval
-
-    rd_bps  = rd_sectors / interval * bytes_per_sector
-    wr_bps  = wr_sectors / interval * bytes_per_sector
-
-    tot_ios = rd_ios + wr_ios
-    tot_iops = tot_ios / interval
-
-    if tot_iops:
-        servicetime = tot_ticks / tot_ios
+        human_text = f"{disk}: {status_str} ({util_percent:.2f}%)"
+        
+        # Performance Data Strings (Key=Value;Warn;Crit;Min;Max)
+        perf_data = (f"{disk}_util={util_percent:.2f}%;{warning_threshold};{critical_threshold};0;100 "
+                     f"{disk}_rd_iops={rd_iops:.2f} {disk}_wr_iops={wr_iops:.2f} "
+                     f"{disk}_rd_bps={rd_bps:.2f}B {disk}_wr_bps={wr_bps:.2f}B")
     else:
-        servicetime = 0
+        human_text = f"{disk}: INITIALIZING"
+        exit_code = 3
+        if not state.has_section("state"): state.add_section("state")
 
-    if tot_ios:
-        tot_avg_wait = (rd_ticks + wr_ticks) / tot_ios
+    # Save State for next run
+    for key, val in currstate.items():
+        state.set("state", key, str(val))
+    with open(state_file, "w") as f:
+        state.write(f)
+    
+    return exit_code, human_text, perf_data
+
+# --- Main ---
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Nagios Disk Stats Check")
+    parser.add_argument("-w", "--warning", type=float, default=75, help="Warning threshold (util %)")
+    parser.add_argument("-c", "--critical", type=float, default=85, help="Critical threshold (util %)")
+    parser.add_argument("disk", nargs='?', help="Disk name (e.g. sda). If omitted, all disks are checked.")
+    args = parser.parse_args()
+
+    # Disk-Auswahl
+    if args.disk:
+        disks_to_check = [args.disk]
     else:
-        tot_avg_wait = 0
+        # Finde alle relevanten Block-Geräte, ignoriere Partitionen, Loop-Devices und RAM-Disks
+        disks_to_check = [d for d in os.listdir("/sys/block/") 
+                          if not d.startswith(("loop", "ram", "zram"))]
 
-    if rd_ios:
-        rd_avg_wait = rd_ticks / rd_ios
-        rd_avg_size = rd_sectors * bytes_per_sector / rd_ios
-    else:
-        rd_avg_wait = 0
-        rd_avg_size = 0
+    overall_exit_code = 0
+    all_summaries = []
+    all_perfdata = []
 
-    # Normalized IOPS are calculated by taking the request size into account,
-    # and basically say how many requests of size 4096 it would have taken
-    # to accomplish what one bigger request has read/written.
-    rd_normratio = rd_avg_size / 4096.
-    rd_normiops  = rd_normratio * rd_iops
+    for d in disks_to_check:
+        rc, txt, perf = check_disk(d, args.warning, args.critical)
+        all_summaries.append(txt)
+        if perf:
+            all_perfdata.append(perf)
+        
+        # Der höchste Status gewinnt (0 < 3 < 1 < 2 in Nagios-Priorität, 
+        # hier vereinfacht über max() da 2 der höchste ist)
+        if rc == 1 and overall_exit_code == 0: overall_exit_code = 1
+        if rc == 2: overall_exit_code = 2
+        if rc == 3 and overall_exit_code == 0: overall_exit_code = 3
 
-    if wr_ios:
-        wr_avg_wait = wr_ticks / wr_ios
-        wr_avg_size = wr_sectors * bytes_per_sector / wr_ios
-    else:
-        wr_avg_wait = 0
-        wr_avg_size = 0
-
-    wr_normratio = wr_avg_size / 4096.
-    wr_normiops  = wr_normratio * wr_iops
-    tot_normiops = rd_normiops + wr_normiops
-
-    util_percent = tot_ticks / (interval * 1000.) * 100.
-
-    if util_percent > 75:
-        exit = 1
-    if util_percent > 85:
-        exit = 2
-
-    out =  ("Disk load for %(disk)s is at %(util_percent).2f%%.|"
-            "rd_iops=%(rd_iops).2f wr_iops=%(wr_iops).2f "
-            "tot_iops=%(tot_iops).2f "
-            "rd_normiops=%(rd_normiops).2f wr_normiops=%(wr_normiops).2f "
-            "tot_normiops=%(tot_normiops).2f "
-            "rd_normratio=%(rd_normratio).2f wr_normratio=%(wr_normratio).2f "
-            "rd_bps=%(rd_bps).2fB/s wr_bps=%(wr_bps).2fB/s "
-            "tot_avg_wait=%(tot_avg_wait)fs "
-            "rd_avg_wait=%(rd_avg_wait)fs wr_avg_wait=%(wr_avg_wait)fs "
-            "rd_avg_size=%(rd_avg_size).2fB wr_avg_size=%(wr_avg_size).2fB "
-            "load_percent=%(util_percent).2f%%;75;85;0;100 ") % {
-        "disk":         disk,
-        "util_percent": util_percent,
-        "rd_iops":      rd_iops,
-        "wr_iops":      wr_iops,
-        "tot_iops":     tot_iops,
-        "rd_normiops":  rd_normiops,
-        "wr_normiops":  wr_normiops,
-        "tot_normiops": tot_normiops,
-        "rd_normratio": rd_normratio,
-        "wr_normratio": wr_normratio,
-        "rd_bps":       rd_bps,
-        "wr_bps":       wr_bps,
-        "rd_avg_wait":  rd_avg_wait / 1000.,
-        "wr_avg_wait":  wr_avg_wait / 1000.,
-        "rd_avg_size":  rd_avg_size,
-        "wr_avg_size":  wr_avg_size,
-        "tot_avg_wait": tot_avg_wait / 1000.,
-        }
-
-    if tot_ios and tot_normiops and util_percent:
-        ioindex   = int(tot_iops / util_percent)
-        normindex = int(tot_normiops / util_percent)
-        out += "ioindex=%d normindex=%d " % (ioindex, normindex)
-
-    print(out)
-
-else:
-    print("Need state info, please wait until Nagios checks again.")
-    exit = 3
-    if not state.has_section("state"):
-        state.add_section("state")
-
-# Copy all values from currstate to the statfile and save it.
-for key in currstate:
-    state.set("state", key, str(currstate[key]))
-
-state.write( open( "/dev/shm/diskstats.%s" % disk, "w" ) )
-
-sys.exit(exit)
+    final_output = f"{', '.join(all_summaries)} | {' '.join(all_perfdata)}"
+    print(final_output)
+    
+    sys.exit(overall_exit_code)
