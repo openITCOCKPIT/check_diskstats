@@ -1,10 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # kate: space-indent on; indent-width 4; replace-tabs on;
 
 """
  *  Copyright (C) 2011-2012, it-novum GmbH
  *  Copyright (c) 2017 SUSE LLC
+ *  Copyright (c) 2025-today AVENDIS GmbH
  *
  *  openATTIC is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by
@@ -18,15 +19,10 @@
 
 import os
 import sys
+import argparse
 from time import time, mktime
 from datetime import datetime
-
-try:
-    # Python 3 variant
-    from configparser import ConfigParser
-except ImportError:
-    # Python 2 variant
-    from ConfigParser import ConfigParser
+from configparser import ConfigParser
 
 try:
     # Uncomment the following line to disable the device UUID check.
@@ -37,9 +33,21 @@ except ImportError:
 else:
     HAVE_UDEV = True
 
+parser = argparse.ArgumentParser(description="Naemon Disk Stats Check", add_help=True)
+parser.add_argument("-w", "--warning", type=float, default=75, help="Warning threshold (disk util in %%)")
+parser.add_argument("-c", "--critical", type=float, default=85, help="Critical threshold (disk util in %%)")
+parser.add_argument("disk", nargs='?', help="Disk name (e.g. /dev/sda)")
+args = parser.parse_args()
+
+warning_threshold = args.warning
+critical_threshold = args.critical
+
+if not args.disk:
+    print("No disk specified. Use --help for usage.")
+    sys.exit(1)
 
 # Resolve the real device path, dereferencing symlinks as necessary.
-disk = os.path.realpath(sys.argv[-1]).replace("/dev/", "")
+disk = os.path.realpath(args.disk).replace("/dev/", "")
 
 # Read the state file (if possible).
 state = ConfigParser()
@@ -181,13 +189,17 @@ if havestate:
     tot_normiops = rd_normiops + wr_normiops
 
     util_percent = tot_ticks / (interval * 1000.) * 100.
+    state_str = "Ok:"
 
-    if util_percent > 75:
+    if util_percent > warning_threshold:
         exit = 1
-    if util_percent > 85:
-        exit = 2
+        state_str = "Warning:"
 
-    out =  ("Disk load for %(disk)s is at %(util_percent).2f%%.|"
+    if util_percent > critical_threshold:
+        exit = 2
+        state_str = "Critical:"
+
+    out =  ("%(state_str)s Disk load for %(disk)s is at %(util_percent).2f%%.|"
             "rd_iops=%(rd_iops).2f wr_iops=%(wr_iops).2f "
             "tot_iops=%(tot_iops).2f "
             "rd_normiops=%(rd_normiops).2f wr_normiops=%(wr_normiops).2f "
@@ -197,7 +209,8 @@ if havestate:
             "tot_avg_wait=%(tot_avg_wait)fs "
             "rd_avg_wait=%(rd_avg_wait)fs wr_avg_wait=%(wr_avg_wait)fs "
             "rd_avg_size=%(rd_avg_size).2fB wr_avg_size=%(wr_avg_size).2fB "
-            "load_percent=%(util_percent).2f%%;75;85;0;100 ") % {
+            "load_percent=%(util_percent).2f%%;%(warning_threshold)d;%(critical_threshold)d;0;100 ") % {
+        "state_str": state_str,
         "disk":         disk,
         "util_percent": util_percent,
         "rd_iops":      rd_iops,
@@ -215,6 +228,8 @@ if havestate:
         "rd_avg_size":  rd_avg_size,
         "wr_avg_size":  wr_avg_size,
         "tot_avg_wait": tot_avg_wait / 1000.,
+        "warning_threshold": warning_threshold,
+        "critical_threshold": critical_threshold
         }
 
     if tot_ios and tot_normiops and util_percent:
@@ -225,7 +240,7 @@ if havestate:
     print(out)
 
 else:
-    print("Need state info, please wait until Nagios checks again.")
+    print("Need state info, please wait until openITCOCKPIT checks again.")
     exit = 3
     if not state.has_section("state"):
         state.add_section("state")
